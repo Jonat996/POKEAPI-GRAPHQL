@@ -1,0 +1,19 @@
+@import "tailwindcss";
+
+@font-face {
+    font-family: "Pokemon";
+    src: url("../assets/fonts/pokemon-solid.woff2") format("woff2");
+    font-style: normal;
+    font-display: swap;
+}
+@font-face {
+    font-family: "Pokemon-hollow";
+    src: url("../assets/fonts/pokemon-hollow.woff2") format("woff2");
+    font-style: normal;
+    font-display: swap;
+}
+
+@theme {
+    --font-poke: 'Pokemon', sans-serif;
+    --font-poke-light: 'Pokemon-hollow', sans-serif;
+}
