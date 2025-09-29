@@ -3,11 +3,11 @@
 # =============================================================================
 # This workflow handles all PR notification events in a single place:
 # 1. ready_for_review: Creates initial notification and thread
-# 2. synchronize: Updates notification when new commits are pushed
-# 3. changes_requested: Notifies when changes are requested and converts to draft
+# 2. synchronize: Updates notification when new commits are pushed (detects if addressing changes)
+# 3. changes_requested: Notifies when changes are requested and adds labels for tracking
 # 
-# Uses PR comments to persist thread_ts instead of artifacts (which don't work
-# across different workflow runs)
+# Uses PR comments to persist thread_ts and labels for state tracking
+# No draft conversion (GitHub API limitation with reviewed PRs)
 # =============================================================================
 
 name: PR Slack Notifications
@@ -148,6 +148,7 @@ jobs:
           COMMENTS_RESPONSE=$(curl -s \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
             https://api.github.com/repos/${{ github.repository }}/issues/${PR_NUMBER}/comments)
           
           echo "Comments API response length: $(echo "$COMMENTS_RESPONSE" | wc -c)"
@@ -175,54 +176,77 @@ jobs:
           echo "========================================================================"
 
       # =============================================================================
-      # STEP 4: PR STATE MODIFICATION (FROM CHANGES REQUESTED WORKFLOW)
+      # STEP 4: ENHANCED PR STATE MANAGEMENT (LABEL-BASED)
       # =============================================================================
       
-      # Debug step to verify conditions for draft conversion
-      - name: Debug draft conversion conditions
-        if: github.event_name == 'pull_request_review'
-        run: |
-          echo "========================= DEBUG: DRAFT CONVERSION CONDITIONS ========================="
-          echo "EVENT_TYPE: '$EVENT_TYPE'"
-          echo "github.event.review.state: '${{ github.event.review.state }}'"
-          echo "github.event_name: '${{ github.event_name }}'"
-          echo "Should convert to draft? $(if [[ "$EVENT_TYPE" == "changes_requested" ]]; then echo "YES"; else echo "NO"; fi)"
-          echo "===================================================================================="
-      
-      # Converts PR to draft ONLY when changes are explicitly requested
-      - name: Convert PR to Draft (only for changes_requested)
+      # Add label when changes are requested
+      - name: Add "changes-requested" label
         if: env.EVENT_TYPE == 'changes_requested' && github.event_name == 'pull_request_review'
         run: |
-          echo "========================= DEBUG: PR TO DRAFT ========================="
-          echo "Converting PR #$PR_NUMBER to draft..."
-          echo "EVENT_TYPE: $EVENT_TYPE"
-          echo "Review state: ${{ github.event.review.state }}"
-          echo "Event name: ${{ github.event_name }}"
+          echo "========================= DEBUG: ADDING LABEL ========================="
+          echo "Adding 'changes-requested' label to PR #$PR_NUMBER"
           
-          echo "✅ Converting PR to draft - changes were requested"
-          
-          echo "All validations passed - proceeding with draft conversion"
-          
-          DRAFT_RESPONSE=$(curl -s -X PATCH \
+          # Remove any existing status labels first
+          curl -s -X DELETE \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/${{ github.repository }}/pulls/${PR_NUMBER} \
-            -d '{"draft": true}')
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/${{ github.repository }}/issues/${PR_NUMBER}/labels/ready-for-review
           
-          echo "Draft conversion response:"
-          echo "$DRAFT_RESPONSE"
+          # Add changes-requested label
+          LABEL_RESPONSE=$(curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/${{ github.repository }}/issues/${PR_NUMBER}/labels \
+            -d '{"labels": ["changes-requested"]}')
           
-          # Verify the conversion was successful
-          DRAFT_STATUS=$(echo "$DRAFT_RESPONSE" | jq -r '.draft')
-          echo "New draft status: $DRAFT_STATUS"
+          echo "Label response:"
+          echo "$LABEL_RESPONSE"
+          echo "================================================================"
+
+      # Enhanced synchronize handler that detects post-changes updates
+      - name: Check if this is addressing requested changes
+        if: env.EVENT_TYPE == 'synchronize'
+        run: |
+          echo "========================= DEBUG: CHECKING CHANGES STATUS ========================="
+          echo "Checking if this update addresses requested changes..."
           
-          if [[ "$DRAFT_STATUS" == "true" ]]; then
-            echo "✅ SUCCESS: PR #$PR_NUMBER converted to draft"
+          # Check if PR has changes-requested label
+          PR_LABELS=$(curl -s \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/${{ github.repository }}/issues/${PR_NUMBER}/labels)
+          
+          echo "Current PR labels:"
+          echo "$PR_LABELS" | jq -r '.[].name'
+          
+          HAS_CHANGES_REQUESTED=$(echo "$PR_LABELS" | jq -r '.[] | select(.name=="changes-requested") | .name')
+          
+          if [[ -n "$HAS_CHANGES_REQUESTED" ]]; then
+            echo "PR has 'changes-requested' label - this update addresses feedback"
+            echo "UPDATE_TYPE=addressing_changes" >> $GITHUB_ENV
+            
+            # Remove the changes-requested label and add ready-for-review
+            curl -s -X DELETE \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              https://api.github.com/repos/${{ github.repository }}/issues/${PR_NUMBER}/labels/changes-requested
+              
+            curl -s -X POST \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              https://api.github.com/repos/${{ github.repository }}/issues/${PR_NUMBER}/labels \
+              -d '{"labels": ["ready-for-review"]}'
+              
           else
-            echo "❌ ERROR: Failed to convert PR #$PR_NUMBER to draft"
-            echo "Draft status returned: $DRAFT_STATUS"
+            echo "Regular update - no recent change requests"
+            echo "UPDATE_TYPE=regular_update" >> $GITHUB_ENV
           fi
-          echo "===================================================================="
+          echo "============================================================================="
       # =============================================================================
       # STEP 5: SLACK NOTIFICATIONS (FROM ORIGINAL WORKFLOWS)
       # =============================================================================
@@ -310,29 +334,36 @@ jobs:
           echo "NEW_THREAD_TS=$THREAD_TS" >> $GITHUB_ENV
           echo "============================================================================="
 
-      # FROM: pr-updates.yml (synchronize workflow)
-      # Replies to existing thread when PR is updated with new commits
-      - name: Send Slack notification - Updates
+      # Enhanced synchronize notification that detects addressing changes vs regular updates
+      - name: Send Slack notification - Updates (Enhanced)
         if: env.EVENT_TYPE == 'synchronize'
         run: |
-          echo "========================= DEBUG: SLACK UPDATES ========================="
-          echo "Sending Slack notification for synchronize event"
+          echo "========================= DEBUG: SLACK UPDATES ENHANCED ========================="
+          echo "Sending enhanced Slack notification for synchronize event"
+          echo "UPDATE_TYPE: ${{ env.UPDATE_TYPE }}"
           echo "Using thread_ts: ${{ env.THREAD_TS }}"
           echo "SLACK_MENTIONS: ${{ env.SLACK_MENTIONS }}"
+          
+          # Choose message based on update type
+          if [[ "${{ env.UPDATE_TYPE }}" == "addressing_changes" ]]; then
+            MESSAGE_TEXT=":white_check_mark: *PR #${PR_NUMBER}* updated to address requested changes! Ready for re-review :eyes:\nReviewers: ${{ env.SLACK_MENTIONS }}"
+          else
+            MESSAGE_TEXT=":repeat: Updates pushed to *PR #${PR_NUMBER}* are ready for review again 🚀\nReviewers: ${{ env.SLACK_MENTIONS }}"
+          fi
           
           # Try with thread first, then fallback to regular message
           if [[ -n "${{ env.THREAD_TS }}" && "${{ env.THREAD_TS }}" != "null" ]]; then
             echo "Attempting to send threaded message..."
             UPDATE_PAYLOAD="{
               \"channel\": \"C083EA771T5\",
-              \"text\": \":repeat: Updates pushed to *PR #${PR_NUMBER}* are ready for review again 🚀\nReviewers: ${{ env.SLACK_MENTIONS }}\",
+              \"text\": \"$MESSAGE_TEXT\",
               \"thread_ts\": \"${{ env.THREAD_TS }}\"
             }"
           else
             echo "No valid thread_ts found, sending regular message..."
             UPDATE_PAYLOAD="{
               \"channel\": \"C083EA771T5\",
-              \"text\": \":repeat: Updates pushed to *PR #${PR_NUMBER}* are ready for review again 🚀\nReviewers: ${{ env.SLACK_MENTIONS }}\"
+              \"text\": \"$MESSAGE_TEXT\"
             }"
           fi
           
@@ -360,7 +391,7 @@ jobs:
               echo "Thread failed, trying regular message..."
               FALLBACK_PAYLOAD="{
                 \"channel\": \"C083EA771T5\",
-                \"text\": \":repeat: Updates pushed to *PR #${PR_NUMBER}* are ready for review again 🚀\nReviewers: ${{ env.SLACK_MENTIONS }} (Note: Original thread not found)\"
+                \"text\": \"$MESSAGE_TEXT (Note: Original thread not found)\"
               }"
               
               FALLBACK_RESPONSE=$(curl -s -X POST \
@@ -373,11 +404,10 @@ jobs:
               echo "$FALLBACK_RESPONSE"
             fi
           fi
-          echo "====================================================================="
+          echo "============================================================================="
 
-      # FROM: pr-changes-requested.yml (changes_requested workflow)
-      # Replies to existing thread when changes are requested on the PR
-      - name: Send Slack notification - Changes Requested
+      # Enhanced changes requested notification (label-based approach)
+      - name: Send Slack notification - Changes Requested (Enhanced)
         if: env.EVENT_TYPE == 'changes_requested' && env.THREAD_TS != '' && env.THREAD_TS != 'null' && github.event.review.state == 'changes_requested'
         run: |
           echo "========================= DEBUG: SLACK CHANGES REQUESTED ========================="
@@ -388,7 +418,7 @@ jobs:
           
           CHANGES_PAYLOAD="{
             \"channel\": \"C083EA771T5\",
-            \"text\": \":warning: Changes requested → PR moved back to *Draft*. ${{ env.AUTHOR_MENTION }}, please update it.\",
+            \"text\": \":warning: Changes requested on *PR #${PR_NUMBER}*. ${{ env.AUTHOR_MENTION }}, please address the feedback and push updates. (Labeled as 'changes-requested')\",
             \"thread_ts\": \"${{ env.THREAD_TS }}\"
           }"
           echo "Changes payload:"
@@ -408,7 +438,6 @@ jobs:
           if [[ "$SUCCESS" != "true" ]]; then
             echo "ERROR: Slack API call failed"
             ERROR=$(echo "$RESPONSE" | jq -r '.error')
-            echo "Error: $ERROR"
           fi
           echo "============================================================================"
 
@@ -431,6 +460,7 @@ jobs:
           COMMENT_RESPONSE=$(curl -s -X POST \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
             https://api.github.com/repos/${{ github.repository }}/issues/${PR_NUMBER}/comments \
             -d "$COMMENT_PAYLOAD")
           
