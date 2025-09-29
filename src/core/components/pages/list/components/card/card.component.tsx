@@ -6,13 +6,16 @@ interface CardProps {
 
 export const PokeCard = ({ nombre, imagen }: CardProps) => {
   return (
-    <div className="w-3xs bg-sky-800 shadow-lg shadow-black/50 rounded-t-sm rounded-b-4xl text-center m-2 p-4">
+    <div
+      className="w-3xs bg-sky-800 shadow-lg shadow-black/50 rounded-t-sm rounded-b-4xl text-center m-2 p-4
+     hover:scale-125 transition-transform duration-300"
+    >
       <img
         className={`w-80 ${styles.poke_card_image}`}
         src={imagen}
         alt={nombre}
       />
-      <h3 className="text-white font-poke-light text-2xl text">{nombre}</h3>
+      <h3 className="text-white font-poke-light text-2xl text hover:scale-125 transition-transform duration-300 ">{nombre}</h3>
     </div>
   );
 };
