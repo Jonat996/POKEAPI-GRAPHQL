@@ -1,0 +1,455 @@
+# =============================================================================
+# CONSOLIDATED PR SLACK NOTIFICATIONS WORKFLOW
+# =============================================================================
+# This workflow handles all PR notification events in a single place:
+# 1. ready_for_review: Creates initial notification and thread
+# 2. synchronize: Updates notification when new commits are pushed
+# 3. changes_requested: Notifies when changes are requested and converts to draft
+# 
+# Uses PR comments to persist thread_ts instead of artifacts (which don't work
+# across different workflow runs)
+# =============================================================================
+
+name: PR Slack Notifications
+
+# Add permissions for GitHub API access
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+on:
+  pull_request:
+    types: [ready_for_review, synchronize]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      # =============================================================================
+      # STEP 1: EVENT DETECTION AND PR DATA EXTRACTION
+      # =============================================================================
+      # Determine which event triggered this workflow and extract relevant PR data
+      # Sets EVENT_TYPE variable to control subsequent steps
+      - name: Determine event type and extract PR details
+        run: |
+          echo "========================= DEBUG: EVENT DETECTION ========================="
+          echo "Event name: ${{ github.event_name }}"
+          echo "Event action: ${{ github.event.action }}"
+          echo "Review state: ${{ github.event.review.state }}"
+          echo "Review body: ${{ github.event.review.body }}"
+          echo "Repository: ${{ github.repository }}"
+          echo "PR Number: ${{ github.event.pull_request.number }}"
+          echo "Full review object:"
+          echo '${{ toJson(github.event.review) }}'
+          echo "========================================================================="
+          
+          echo "PR_NUMBER=${{ github.event.pull_request.number }}" >> $GITHUB_ENV
+          echo "PR_TITLE=${{ github.event.pull_request.title }}" >> $GITHUB_ENV
+          echo "PR_URL=${{ github.event.pull_request.html_url }}" >> $GITHUB_ENV
+          echo "PR_AUTHOR=${{ github.event.pull_request.user.login }}" >> $GITHUB_ENV
+          
+          # Determine event type for conditional logic
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            if [[ "${{ github.event.action }}" == "ready_for_review" ]]; then
+              echo "EVENT_TYPE=ready_for_review" >> $GITHUB_ENV
+              echo "REVIEWERS=$(jq -r '.pull_request.requested_reviewers[].login' $GITHUB_EVENT_PATH | paste -sd ' ' -)" >> $GITHUB_ENV
+            elif [[ "${{ github.event.action }}" == "synchronize" ]]; then
+              echo "EVENT_TYPE=synchronize" >> $GITHUB_ENV
+              echo "REVIEWERS=$(jq -r '.pull_request.requested_reviewers[].login' $GITHUB_EVENT_PATH | paste -sd ' ' -)" >> $GITHUB_ENV
+            fi
+          elif [[ "${{ github.event_name }}" == "pull_request_review" ]] && [[ "${{ github.event.review.state }}" == "changes_requested" ]]; then
+            echo "EVENT_TYPE=changes_requested" >> $GITHUB_ENV
+          fi
+          
+          echo "========================= DEBUG: DETECTED EVENT_TYPE ========================="
+          echo "EVENT_TYPE: $EVENT_TYPE"
+          echo "PR_AUTHOR: $PR_AUTHOR"
+          echo "REVIEWERS: $REVIEWERS"
+          echo "==========================================================================="
+
+      # Skip workflow if event is not relevant for notifications
+      - name: Skip if not relevant event
+        if: env.EVENT_TYPE == ''
+        run: |
+          echo "========================= DEBUG: SKIPPING ========================="
+          echo "Event not relevant for notifications"
+          echo "Event name: ${{ github.event_name }}"
+          echo "Event action: ${{ github.event.action }}"
+          echo "Review state: ${{ github.event.review.state }}"
+          echo "================================================================"
+          exit 0
+
+      # =============================================================================
+      # STEP 2: USER MAPPING (COMMON LOGIC)
+      # =============================================================================
+      # Maps GitHub usernames to Slack user IDs for proper notifications
+      # This mapping is shared across all three original workflows
+      - name: Map GitHub usernames to Slack IDs
+        run: |
+          echo "========================= DEBUG: USER MAPPING ========================="
+          echo "Mapping users for EVENT_TYPE: $EVENT_TYPE"
+          echo "PR_AUTHOR: $PR_AUTHOR"
+          echo "REVIEWERS: $REVIEWERS"
+          
+          declare -A MAP=(
+            ["Devv1507"]="<@U07HVSPA39B>"
+            ["StevenBernal"]="<@U03Q7PDUUBH>"
+            ["DanielQuitian69"]="<@U0183SFT24B>"
+            ["corsariopsique"]="<@U08HSCSP56H>"
+            ["judasane"]="<@U02C22WR1EX>"
+            ["JonathanMartinez"]="<@U04MC41Q5A7>"
+          )
+
+          # Map author (used in all workflows)
+          AUTHOR="${MAP[${PR_AUTHOR}]:-@${PR_AUTHOR}}"
+          echo "AUTHOR_MENTION=$AUTHOR" >> $GITHUB_ENV
+          echo "Mapped author: $PR_AUTHOR → $AUTHOR"
+
+          # Map reviewers (only for ready_for_review and synchronize events)
+          if [[ "$EVENT_TYPE" == "ready_for_review" || "$EVENT_TYPE" == "synchronize" ]]; then
+            echo "Mapping reviewers..."
+            SLACK_MENTIONS=""
+            
+            if [[ -z "$REVIEWERS" ]]; then
+              echo "WARNING: No reviewers found for this PR"
+              SLACK_MENTIONS="No reviewers assigned"
+            else
+              for user in $REVIEWERS; do
+                if [[ -n "${MAP[$user]}" ]]; then
+                  SLACK_MENTIONS="$SLACK_MENTIONS ${MAP[$user]}"
+                  echo "Mapped reviewer: $user → ${MAP[$user]}"
+                else
+                  SLACK_MENTIONS="$SLACK_MENTIONS @$user"
+                  echo "Unmapped reviewer: $user → @$user"
+                fi
+              done
+            fi
+            
+            echo "SLACK_MENTIONS=$SLACK_MENTIONS" >> $GITHUB_ENV
+            echo "Final SLACK_MENTIONS: '$SLACK_MENTIONS'"
+          fi
+          echo "======================================================================"
+
+      # =============================================================================
+      # STEP 3: THREAD PERSISTENCE LOGIC (REPLACES ARTIFACTS)
+      # =============================================================================
+      # Retrieves existing thread_ts from PR comments instead of using artifacts
+      # This solves the cross-workflow artifact sharing issue
+      - name: Get existing thread_ts from PR comments
+        if: env.EVENT_TYPE != 'ready_for_review'
+        run: |
+          echo "========================= DEBUG: THREAD RETRIEVAL ========================="
+          echo "Looking for existing thread_ts for PR #$PR_NUMBER"
+          
+          echo "Making API call to get PR comments..."
+          COMMENTS_RESPONSE=$(curl -s \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${{ github.repository }}/issues/${PR_NUMBER}/comments)
+          
+          echo "Comments API response length: $(echo "$COMMENTS_RESPONSE" | wc -c)"
+          echo "Comments found: $(echo "$COMMENTS_RESPONSE" | jq 'length')"
+          
+          # Look for slack thread comments
+          SLACK_COMMENTS=$(echo "$COMMENTS_RESPONSE" | jq -r '.[] | select(.body | startswith("<!-- slack-thread-ts:")) | .body')
+          echo "Slack thread comments found:"
+          echo "$SLACK_COMMENTS"
+          
+          # Extract the last valid (non-null) thread_ts
+          THREAD_TS=$(echo "$SLACK_COMMENTS" | grep -o 'slack-thread-ts: [^[:space:]]*' | cut -d' ' -f2 | grep -v '^null$' | tail -1)
+          
+          # If no valid thread_ts found, try the last one anyway
+          if [[ -z "$THREAD_TS" ]]; then
+            THREAD_TS=$(echo "$SLACK_COMMENTS" | grep -o 'slack-thread-ts: [^[:space:]]*' | cut -d' ' -f2 | tail -1)
+          fi
+          
+          echo "Extracted THREAD_TS: '$THREAD_TS'"
+          if [[ -z "$THREAD_TS" || "$THREAD_TS" == "null" ]]; then
+            echo "WARNING: No valid thread_ts found for this PR"
+          fi
+          
+          echo "THREAD_TS=$THREAD_TS" >> $GITHUB_ENV
+          echo "========================================================================"
+
+      # =============================================================================
+      # STEP 4: PR STATE MODIFICATION (FROM CHANGES REQUESTED WORKFLOW)
+      # =============================================================================
+      
+      # Debug step to verify conditions for draft conversion
+      - name: Debug draft conversion conditions
+        if: github.event_name == 'pull_request_review'
+        run: |
+          echo "========================= DEBUG: DRAFT CONVERSION CONDITIONS ========================="
+          echo "EVENT_TYPE: '$EVENT_TYPE'"
+          echo "github.event.review.state: '${{ github.event.review.state }}'"
+          echo "github.event_name: '${{ github.event_name }}'"
+          echo "Should convert to draft? $(if [[ "$EVENT_TYPE" == "changes_requested" ]]; then echo "YES"; else echo "NO"; fi)"
+          echo "===================================================================================="
+      
+      # Converts PR to draft ONLY when changes are explicitly requested
+      - name: Convert PR to Draft (only for changes_requested)
+        if: env.EVENT_TYPE == 'changes_requested' && github.event_name == 'pull_request_review'
+        run: |
+          echo "========================= DEBUG: PR TO DRAFT ========================="
+          echo "Converting PR #$PR_NUMBER to draft..."
+          echo "EVENT_TYPE: $EVENT_TYPE"
+          echo "Review state: ${{ github.event.review.state }}"
+          echo "Event name: ${{ github.event_name }}"
+          
+          echo "✅ Converting PR to draft - changes were requested"
+          
+          echo "All validations passed - proceeding with draft conversion"
+          
+          DRAFT_RESPONSE=$(curl -s -X PATCH \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${{ github.repository }}/pulls/${PR_NUMBER} \
+            -d '{"draft": true}')
+          
+          echo "Draft conversion response:"
+          echo "$DRAFT_RESPONSE"
+          
+          # Verify the conversion was successful
+          DRAFT_STATUS=$(echo "$DRAFT_RESPONSE" | jq -r '.draft')
+          echo "New draft status: $DRAFT_STATUS"
+          
+          if [[ "$DRAFT_STATUS" == "true" ]]; then
+            echo "✅ SUCCESS: PR #$PR_NUMBER converted to draft"
+          else
+            echo "❌ ERROR: Failed to convert PR #$PR_NUMBER to draft"
+            echo "Draft status returned: $DRAFT_STATUS"
+          fi
+          echo "===================================================================="
+      # =============================================================================
+      # STEP 5: SLACK NOTIFICATIONS (FROM ORIGINAL WORKFLOWS)
+      # =============================================================================
+      
+      # FROM: pr-notification.yml (ready_for_review workflow)
+      # Creates the initial Slack message and captures thread_ts for future replies
+      - name: Send Slack notification - Ready for Review
+        if: env.EVENT_TYPE == 'ready_for_review'
+        run: |
+          echo "========================= DEBUG: SLACK READY FOR REVIEW ========================="
+          echo "Sending Slack notification for ready_for_review event"
+          echo "Channel: C083EA771T5"
+          echo "PR_NUMBER: $PR_NUMBER"
+          echo "PR_TITLE: $PR_TITLE"
+          echo "PR_URL: $PR_URL"
+          echo "AUTHOR_MENTION: ${{ env.AUTHOR_MENTION }}"
+          echo "SLACK_MENTIONS: ${{ env.SLACK_MENTIONS }}"
+          
+          # Test bot permissions first
+          echo "Testing bot permissions..."
+          AUTH_TEST=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.SLACK_BOT_TOKEN }}" \
+            -H "Content-type: application/json" \
+            https://slack.com/api/auth.test)
+          
+          echo "Auth test response:"
+          echo "$AUTH_TEST"
+          
+          # Test channel access (fix the API call)
+          echo "Testing channel access..."
+          CHANNEL_INFO=$(curl -s -X GET \
+            -H "Authorization: Bearer ${{ secrets.SLACK_BOT_TOKEN }}" \
+            "https://slack.com/api/conversations.info?channel=C083EA771T5")
+          
+          echo "Channel info response:"
+          echo "$CHANNEL_INFO"
+          
+          # List all channels the bot can access
+          echo "Listing channels bot has access to..."
+          CHANNELS_LIST=$(curl -s -X GET \
+            -H "Authorization: Bearer ${{ secrets.SLACK_BOT_TOKEN }}" \
+            "https://slack.com/api/conversations.list?types=public_channel,private_channel&limit=50")
+          
+          echo "Channels bot can access:"
+          echo "$CHANNELS_LIST" | jq -r '.channels[]? | "\(.id) - \(.name) - member:\(.is_member) - private:\(.is_private)"'
+          
+          # Check if target channel exists and bot is member
+          TARGET_CHANNEL=$(echo "$CHANNELS_LIST" | jq -r '.channels[]? | select(.id=="C083EA771T5")')
+          if [[ -n "$TARGET_CHANNEL" ]]; then
+            echo "Target channel C083EA771T5 found:"
+            echo "$TARGET_CHANNEL" | jq '.'
+            BOT_IS_MEMBER=$(echo "$TARGET_CHANNEL" | jq -r '.is_member')
+            echo "Bot is member: $BOT_IS_MEMBER"
+          else
+            echo "ERROR: Target channel C083EA771T5 not found in bot's accessible channels"
+          fi
+          
+          MESSAGE_PAYLOAD="{
+            \"channel\": \"C083EA771T5\",
+            \"text\": \":bell: *PR #${PR_NUMBER}* is now *Ready for Review* :eyes:\n*${PR_TITLE}*\nAuthor: ${{ env.AUTHOR_MENTION }}\nReviewers: ${{ env.SLACK_MENTIONS }}\n<${PR_URL}|View PR>\"
+          }"
+          echo "Message payload:"
+          echo "$MESSAGE_PAYLOAD"
+          
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.SLACK_BOT_TOKEN }}" \
+            -H "Content-type: application/json" \
+            --data "$MESSAGE_PAYLOAD" \
+            https://slack.com/api/chat.postMessage)
+
+          echo "Slack API response:"
+          echo "$RESPONSE"
+          
+          THREAD_TS=$(echo "$RESPONSE" | jq -r '.ts')
+          echo "Extracted thread_ts: $THREAD_TS"
+          
+          # Check if Slack API call was successful
+          SUCCESS=$(echo "$RESPONSE" | jq -r '.ok')
+          if [[ "$SUCCESS" != "true" ]]; then
+            echo "ERROR: Slack API call failed"
+            ERROR=$(echo "$RESPONSE" | jq -r '.error')
+            echo "Error: $ERROR"
+          fi
+          
+          echo "NEW_THREAD_TS=$THREAD_TS" >> $GITHUB_ENV
+          echo "============================================================================="
+
+      # FROM: pr-updates.yml (synchronize workflow)
+      # Replies to existing thread when PR is updated with new commits
+      - name: Send Slack notification - Updates
+        if: env.EVENT_TYPE == 'synchronize'
+        run: |
+          echo "========================= DEBUG: SLACK UPDATES ========================="
+          echo "Sending Slack notification for synchronize event"
+          echo "Using thread_ts: ${{ env.THREAD_TS }}"
+          echo "SLACK_MENTIONS: ${{ env.SLACK_MENTIONS }}"
+          
+          # Try with thread first, then fallback to regular message
+          if [[ -n "${{ env.THREAD_TS }}" && "${{ env.THREAD_TS }}" != "null" ]]; then
+            echo "Attempting to send threaded message..."
+            UPDATE_PAYLOAD="{
+              \"channel\": \"C083EA771T5\",
+              \"text\": \":repeat: Updates pushed to *PR #${PR_NUMBER}* are ready for review again 🚀\nReviewers: ${{ env.SLACK_MENTIONS }}\",
+              \"thread_ts\": \"${{ env.THREAD_TS }}\"
+            }"
+          else
+            echo "No valid thread_ts found, sending regular message..."
+            UPDATE_PAYLOAD="{
+              \"channel\": \"C083EA771T5\",
+              \"text\": \":repeat: Updates pushed to *PR #${PR_NUMBER}* are ready for review again 🚀\nReviewers: ${{ env.SLACK_MENTIONS }}\"
+            }"
+          fi
+          
+          echo "Update payload:"
+          echo "$UPDATE_PAYLOAD"
+          
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.SLACK_BOT_TOKEN }}" \
+            -H "Content-type: application/json" \
+            --data "$UPDATE_PAYLOAD" \
+            https://slack.com/api/chat.postMessage)
+          
+          echo "Slack API response:"
+          echo "$RESPONSE"
+          
+          # Check if Slack API call was successful
+          SUCCESS=$(echo "$RESPONSE" | jq -r '.ok')
+          if [[ "$SUCCESS" != "true" ]]; then
+            echo "ERROR: Slack API call failed"
+            ERROR=$(echo "$RESPONSE" | jq -r '.error')
+            echo "Error: $ERROR"
+            
+            # If thread failed, try without thread
+            if [[ "$ERROR" == "thread_not_found" || "$ERROR" == "message_not_found" ]]; then
+              echo "Thread failed, trying regular message..."
+              FALLBACK_PAYLOAD="{
+                \"channel\": \"C083EA771T5\",
+                \"text\": \":repeat: Updates pushed to *PR #${PR_NUMBER}* are ready for review again 🚀\nReviewers: ${{ env.SLACK_MENTIONS }} (Note: Original thread not found)\"
+              }"
+              
+              FALLBACK_RESPONSE=$(curl -s -X POST \
+                -H "Authorization: Bearer ${{ secrets.SLACK_BOT_TOKEN }}" \
+                -H "Content-type: application/json" \
+                --data "$FALLBACK_PAYLOAD" \
+                https://slack.com/api/chat.postMessage)
+              
+              echo "Fallback response:"
+              echo "$FALLBACK_RESPONSE"
+            fi
+          fi
+          echo "====================================================================="
+
+      # FROM: pr-changes-requested.yml (changes_requested workflow)
+      # Replies to existing thread when changes are requested on the PR
+      - name: Send Slack notification - Changes Requested
+        if: env.EVENT_TYPE == 'changes_requested' && env.THREAD_TS != '' && env.THREAD_TS != 'null' && github.event.review.state == 'changes_requested'
+        run: |
+          echo "========================= DEBUG: SLACK CHANGES REQUESTED ========================="
+          echo "Sending Slack notification for changes_requested event"
+          echo "Double-checking review state: ${{ github.event.review.state }}"
+          echo "Using thread_ts: ${{ env.THREAD_TS }}"
+          echo "AUTHOR_MENTION: ${{ env.AUTHOR_MENTION }}"
+          
+          CHANGES_PAYLOAD="{
+            \"channel\": \"C083EA771T5\",
+            \"text\": \":warning: Changes requested → PR moved back to *Draft*. ${{ env.AUTHOR_MENTION }}, please update it.\",
+            \"thread_ts\": \"${{ env.THREAD_TS }}\"
+          }"
+          echo "Changes payload:"
+          echo "$CHANGES_PAYLOAD"
+          
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.SLACK_BOT_TOKEN }}" \
+            -H "Content-type: application/json" \
+            --data "$CHANGES_PAYLOAD" \
+            https://slack.com/api/chat.postMessage)
+          
+          echo "Slack API response:"
+          echo "$RESPONSE"
+          
+          # Check if Slack API call was successful
+          SUCCESS=$(echo "$RESPONSE" | jq -r '.ok')
+          if [[ "$SUCCESS" != "true" ]]; then
+            echo "ERROR: Slack API call failed"
+            ERROR=$(echo "$RESPONSE" | jq -r '.error')
+            echo "Error: $ERROR"
+          fi
+          echo "============================================================================"
+
+      # =============================================================================
+      # STEP 6: THREAD PERSISTENCE STORAGE (REPLACES ARTIFACT UPLOAD)
+      # =============================================================================
+      # Stores thread_ts in a hidden PR comment for future workflow runs
+      # This replaces the artifact-based approach that didn't work across workflows
+      - name: Store thread_ts in PR comment (only for new threads)
+        if: env.EVENT_TYPE == 'ready_for_review' && env.NEW_THREAD_TS != ''
+        run: |
+          echo "========================= DEBUG: THREAD STORAGE ========================="
+          echo "Storing thread_ts in PR comment"
+          echo "thread_ts to store: ${{ env.NEW_THREAD_TS }}"
+          
+          COMMENT_PAYLOAD="{\"body\": \"<!-- slack-thread-ts: ${{ env.NEW_THREAD_TS }} -->\"}"
+          echo "Comment payload:"
+          echo "$COMMENT_PAYLOAD"
+          
+          COMMENT_RESPONSE=$(curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${{ github.repository }}/issues/${PR_NUMBER}/comments \
+            -d "$COMMENT_PAYLOAD")
+          
+          echo "Comment creation response:"
+          echo "$COMMENT_RESPONSE"
+          echo "======================================================================"
+
+      # =============================================================================
+      # FINAL DEBUG SUMMARY
+      # =============================================================================
+      - name: Workflow Summary
+        if: always()
+        run: |
+          echo "========================= WORKFLOW SUMMARY ========================="
+          echo "EVENT_TYPE: $EVENT_TYPE"
+          echo "PR_NUMBER: $PR_NUMBER"
+          echo "PR_AUTHOR: $PR_AUTHOR"
+          echo "AUTHOR_MENTION: ${{ env.AUTHOR_MENTION }}"
+          echo "SLACK_MENTIONS: ${{ env.SLACK_MENTIONS }}"
+          echo "THREAD_TS: ${{ env.THREAD_TS }}"
+          echo "NEW_THREAD_TS: ${{ env.NEW_THREAD_TS }}"
+          echo "================================================================="
