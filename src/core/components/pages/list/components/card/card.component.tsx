@@ -7,7 +7,7 @@ interface CardProps {
 export const PokeCard = ({ nombre, imagen }: CardProps) => {
   return (
     <div
-      className="w-3xs bg-sky-900 shadow-lg shadow-black/50 rounded-t-sm rounded-b-4xl text-center m-2 p-4
+      className="w-3xs bg-sky-800 shadow-lg shadow-black/50 rounded-t-sm rounded-b-4xl text-center m-2 p-4
      hover:scale-125 transition-transform duration-300"
     >
       <img
