@@ -20,7 +20,7 @@ permissions:
 
 on:
   pull_request:
-    types: [ready_for_review, synchronize]
+    types: [labeled, synchronize]
   pull_request_review:
     types: [submitted]
 
@@ -53,7 +53,7 @@ jobs:
           
           # Determine event type for conditional logic
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            if [[ "${{ github.event.action }}" == "ready_for_review" ]]; then
+            if [[ "${{ github.event.action }}" == "labeled" ]] && [[ "${{ github.event.label.name }}" == "ready-for-review" ]]; then
               echo "EVENT_TYPE=ready_for_review" >> $GITHUB_ENV
               echo "REVIEWERS=$(jq -r '.pull_request.requested_reviewers[].login' $GITHUB_EVENT_PATH | paste -sd ' ' -)" >> $GITHUB_ENV
             elif [[ "${{ github.event.action }}" == "synchronize" ]]; then
@@ -136,10 +136,9 @@ jobs:
       # =============================================================================
       # STEP 3: THREAD PERSISTENCE LOGIC (REPLACES ARTIFACTS)
       # =============================================================================
-      # Retrieves existing thread_ts from PR comments instead of using artifacts
-      # This solves the cross-workflow artifact sharing issue
+      # Retrieves existing thread_ts from PR comments for ALL events
+      # This ensures we always use the same thread for each PR
       - name: Get existing thread_ts from PR comments
-        if: env.EVENT_TYPE != 'ready_for_review'
         run: |
           echo "========================= DEBUG: THREAD RETRIEVAL ========================="
           echo "Looking for existing thread_ts for PR #$PR_NUMBER"
@@ -176,22 +175,22 @@ jobs:
           echo "========================================================================"
 
       # =============================================================================
-      # STEP 4: ENHANCED PR STATE MANAGEMENT (LABEL-BASED)
+      # STEP 4: LABEL MANAGEMENT FOR CHANGES REQUESTED
       # =============================================================================
       
       # Add label when changes are requested
       - name: Add "changes-requested" label
         if: env.EVENT_TYPE == 'changes_requested' && github.event_name == 'pull_request_review'
         run: |
-          echo "========================= DEBUG: ADDING LABEL ========================="
+          echo "========================= DEBUG: ADDING CHANGES-REQUESTED LABEL ========================="
           echo "Adding 'changes-requested' label to PR #$PR_NUMBER"
           
-          # Remove any existing status labels first
+          # Remove ready-for-review label if present
           curl -s -X DELETE \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            https://api.github.com/repos/${{ github.repository }}/issues/${PR_NUMBER}/labels/ready-for-review
+            https://api.github.com/repos/${{ github.repository }}/issues/${PR_NUMBER}/labels/ready-for-review || true
           
           # Add changes-requested label
           LABEL_RESPONSE=$(curl -s -X POST \
@@ -203,56 +202,13 @@ jobs:
           
           echo "Label response:"
           echo "$LABEL_RESPONSE"
-          echo "================================================================"
-
-      # Enhanced synchronize handler that detects post-changes updates
-      - name: Check if this is addressing requested changes
-        if: env.EVENT_TYPE == 'synchronize'
-        run: |
-          echo "========================= DEBUG: CHECKING CHANGES STATUS ========================="
-          echo "Checking if this update addresses requested changes..."
-          
-          # Check if PR has changes-requested label
-          PR_LABELS=$(curl -s \
-            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            https://api.github.com/repos/${{ github.repository }}/issues/${PR_NUMBER}/labels)
-          
-          echo "Current PR labels:"
-          echo "$PR_LABELS" | jq -r '.[].name'
-          
-          HAS_CHANGES_REQUESTED=$(echo "$PR_LABELS" | jq -r '.[] | select(.name=="changes-requested") | .name')
-          
-          if [[ -n "$HAS_CHANGES_REQUESTED" ]]; then
-            echo "PR has 'changes-requested' label - this update addresses feedback"
-            echo "UPDATE_TYPE=addressing_changes" >> $GITHUB_ENV
-            
-            # Remove the changes-requested label and add ready-for-review
-            curl -s -X DELETE \
-              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-              -H "Accept: application/vnd.github+json" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              https://api.github.com/repos/${{ github.repository }}/issues/${PR_NUMBER}/labels/changes-requested
-              
-            curl -s -X POST \
-              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-              -H "Accept: application/vnd.github+json" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              https://api.github.com/repos/${{ github.repository }}/issues/${PR_NUMBER}/labels \
-              -d '{"labels": ["ready-for-review"]}'
-              
-          else
-            echo "Regular update - no recent change requests"
-            echo "UPDATE_TYPE=regular_update" >> $GITHUB_ENV
-          fi
-          echo "============================================================================="
+          echo "==============================================================================="
       # =============================================================================
       # STEP 5: SLACK NOTIFICATIONS (FROM ORIGINAL WORKFLOWS)
       # =============================================================================
       
-      # FROM: pr-notification.yml (ready_for_review workflow)
-      # Creates the initial Slack message and captures thread_ts for future replies
+      # Send notification when ready-for-review label is added
+      # Uses existing thread if available, creates new one if not
       - name: Send Slack notification - Ready for Review
         if: env.EVENT_TYPE == 'ready_for_review'
         run: |
@@ -304,10 +260,21 @@ jobs:
             echo "ERROR: Target channel C083EA771T5 not found in bot's accessible channels"
           fi
           
-          MESSAGE_PAYLOAD="{
-            \"channel\": \"C083EA771T5\",
-            \"text\": \":bell: *PR #${PR_NUMBER}* is now *Ready for Review* :eyes:\n*${PR_TITLE}*\nAuthor: ${{ env.AUTHOR_MENTION }}\nReviewers: ${{ env.SLACK_MENTIONS }}\n<${PR_URL}|View PR>\"
-          }"
+          # Use existing thread if available, create new if not
+          if [[ -n "${{ env.THREAD_TS }}" && "${{ env.THREAD_TS }}" != "null" ]]; then
+            echo "Using existing thread for ready-for-review notification"
+            MESSAGE_PAYLOAD="{
+              \"channel\": \"C083EA771T5\",
+              \"text\": \":bell: *PR #${PR_NUMBER}* is now *Ready for Review* :eyes:\n*${PR_TITLE}*\nAuthor: ${{ env.AUTHOR_MENTION }}\nReviewers: ${{ env.SLACK_MENTIONS }}\n<${PR_URL}|View PR>\",
+              \"thread_ts\": \"${{ env.THREAD_TS }}\"
+            }"
+          else
+            echo "Creating new thread for ready-for-review notification"
+            MESSAGE_PAYLOAD="{
+              \"channel\": \"C083EA771T5\",
+              \"text\": \":bell: *PR #${PR_NUMBER}* is now *Ready for Review* :eyes:\n*${PR_TITLE}*\nAuthor: ${{ env.AUTHOR_MENTION }}\nReviewers: ${{ env.SLACK_MENTIONS }}\n<${PR_URL}|View PR>\"
+            }"
+          fi
           echo "Message payload:"
           echo "$MESSAGE_PAYLOAD"
           
@@ -334,33 +301,27 @@ jobs:
           echo "NEW_THREAD_TS=$THREAD_TS" >> $GITHUB_ENV
           echo "============================================================================="
 
-      # Enhanced synchronize notification that detects addressing changes vs regular updates
-      - name: Send Slack notification - Updates (Enhanced)
+      # Send notification when PR is updated (always uses existing thread)
+      - name: Send Slack notification - Updates
         if: env.EVENT_TYPE == 'synchronize'
         run: |
-          echo "========================= DEBUG: SLACK UPDATES ENHANCED ========================="
-          echo "Sending enhanced Slack notification for synchronize event"
-          echo "UPDATE_TYPE: ${{ env.UPDATE_TYPE }}"
+          echo "========================= DEBUG: SLACK UPDATES ========================="
+          echo "Sending Slack notification for synchronize event"
           echo "Using thread_ts: ${{ env.THREAD_TS }}"
           echo "SLACK_MENTIONS: ${{ env.SLACK_MENTIONS }}"
           
-          # Choose message based on update type
-          if [[ "${{ env.UPDATE_TYPE }}" == "addressing_changes" ]]; then
-            MESSAGE_TEXT=":white_check_mark: *PR #${PR_NUMBER}* updated to address requested changes! Ready for re-review :eyes:\nReviewers: ${{ env.SLACK_MENTIONS }}"
-          else
-            MESSAGE_TEXT=":repeat: Updates pushed to *PR #${PR_NUMBER}* are ready for review again 🚀\nReviewers: ${{ env.SLACK_MENTIONS }}"
-          fi
+          MESSAGE_TEXT=":repeat: Updates pushed to *PR #${PR_NUMBER}* are ready for review 🚀\nReviewers: ${{ env.SLACK_MENTIONS }}"
           
-          # Try with thread first, then fallback to regular message
+          # Always try to use existing thread first
           if [[ -n "${{ env.THREAD_TS }}" && "${{ env.THREAD_TS }}" != "null" ]]; then
-            echo "Attempting to send threaded message..."
+            echo "Using existing thread: ${{ env.THREAD_TS }}"
             UPDATE_PAYLOAD="{
               \"channel\": \"C083EA771T5\",
               \"text\": \"$MESSAGE_TEXT\",
               \"thread_ts\": \"${{ env.THREAD_TS }}\"
             }"
           else
-            echo "No valid thread_ts found, sending regular message..."
+            echo "No existing thread found, creating new message (this should rarely happen)"
             UPDATE_PAYLOAD="{
               \"channel\": \"C083EA771T5\",
               \"text\": \"$MESSAGE_TEXT\"
@@ -444,10 +405,10 @@ jobs:
       # =============================================================================
       # STEP 6: THREAD PERSISTENCE STORAGE (REPLACES ARTIFACT UPLOAD)
       # =============================================================================
-      # Stores thread_ts in a hidden PR comment for future workflow runs
-      # This replaces the artifact-based approach that didn't work across workflows
+      # Store thread_ts only if we created a NEW thread (no existing thread_ts)
+      # This ensures we only create one thread per PR
       - name: Store thread_ts in PR comment (only for new threads)
-        if: env.EVENT_TYPE == 'ready_for_review' && env.NEW_THREAD_TS != ''
+        if: env.EVENT_TYPE == 'ready_for_review' && env.NEW_THREAD_TS != '' && (env.THREAD_TS == '' || env.THREAD_TS == 'null')
         run: |
           echo "========================= DEBUG: THREAD STORAGE ========================="
           echo "Storing thread_ts in PR comment"
